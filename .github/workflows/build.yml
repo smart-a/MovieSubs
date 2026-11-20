@@ -499,89 +499,120 @@ jobs:
               }
 
               // ---------- recognition ----------
-              // One recognizer session per utterance. Audio is fed through a pipe using
-              // RecognizerIntent.EXTRA_AUDIO_SOURCE (Android 13+); a new session starts as soon as one ends.
+              // One recognizer session at a time, fed through a pipe (RecognizerIntent.EXTRA_AUDIO_SOURCE, Android 13+).
+              // Movie audio rarely goes quiet, so the recognizer may never send a "final" result. To keep subtitles
+              // flowing, the latest partial text is committed after 1.4 s without change, or after 7 s at most,
+              // and a fresh session starts.
 
               private fun startSession() {
                   if (!running) return
-                  val sr = SpeechRecognizer.createSpeechRecognizer(this)
-                  val pipe = ParcelFileDescriptor.createPipe()
-                  val active = AtomicBoolean(true)
+                  Session().begin()
+              }
 
-                  while (chunks.size > 5) chunks.poll() // keep ~0.5 s of lead-in, drop stale audio
+              private inner class Session {
+                  private val active = AtomicBoolean(true)
+                  private val sr = SpeechRecognizer.createSpeechRecognizer(this@CaptureService)
+                  private val pipe = ParcelFileDescriptor.createPipe()
+                  private var latest = ""
+                  private val quietNow = Runnable { commit() }
+                  private val maxNow = Runnable { commit() }
 
-                  thread(name = "pipe-writer") {
-                      ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { out ->
-                          try {
-                              while (active.get() && running) {
-                                  val c = chunks.poll(200, TimeUnit.MILLISECONDS) ?: continue
-                                  out.write(c)
+                  fun begin() {
+                      while (chunks.size > 5) chunks.poll() // keep ~0.5 s of lead-in, drop stale audio
+
+                      thread(name = "pipe-writer") {
+                          ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { out ->
+                              try {
+                                  while (active.get() && running) {
+                                      val c = chunks.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                                      out.write(c)
+                                  }
+                              } catch (_: IOException) {
                               }
-                          } catch (_: IOException) {
                           }
                       }
+
+                      sr.setRecognitionListener(object : RecognitionListener {
+                          override fun onResults(results: Bundle?) {
+                              if (!active.get()) return
+                              val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                  ?.firstOrNull()?.takeIf { it.isNotBlank() } ?: latest
+                              if (text.isNotBlank()) { failures = 0; onFinalText(text.trim()) }
+                              end(100)
+                          }
+
+                          override fun onPartialResults(partialResults: Bundle?) {
+                              if (!active.get()) return
+                              val t = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                  ?.firstOrNull()
+                              if (t.isNullOrBlank()) return
+                              val firstPartial = latest.isEmpty()
+                              latest = t
+                              failures = 0
+                              main.removeCallbacks(clearRunnable)
+                              overlay?.setOriginalOnly(t)
+                              main.removeCallbacks(quietNow)
+                              main.postDelayed(quietNow, 1400)
+                              if (firstPartial) main.postDelayed(maxNow, 7000)
+                          }
+
+                          override fun onError(error: Int) {
+                              if (!active.get()) return
+                              val quiet = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                                  error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                              if (latest.isNotBlank()) onFinalText(latest.trim())
+                              if (!quiet) failures++
+                              if (failures >= 6) {
+                                  overlay?.set("Speech recognition isn’t accepting the captured audio on this phone.", "")
+                              }
+                              end(if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 600 else if (quiet) 100 else 800)
+                          }
+
+                          override fun onReadyForSpeech(params: Bundle?) {}
+                          override fun onBeginningOfSpeech() {}
+                          override fun onRmsChanged(rmsdB: Float) {}
+                          override fun onBufferReceived(buffer: ByteArray?) {}
+                          override fun onEndOfSpeech() {}
+                          override fun onEvent(eventType: Int, params: Bundle?) {}
+                      })
+
+                      val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang.speechTag)
+                          putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                          putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, pipe[0])
+                          putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+                          putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                          putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, SAMPLE_RATE)
+                      }
+                      sr.startListening(i)
                   }
 
-                  fun finish(restartDelayMs: Long) {
+                  private fun commit() {
+                      if (!active.get()) return
+                      val t = latest.trim()
+                      if (t.isNotEmpty()) onFinalText(t)
+                      end(100)
+                  }
+
+                  private fun end(restartDelayMs: Long) {
                       if (!active.getAndSet(false)) return
+                      main.removeCallbacks(quietNow)
+                      main.removeCallbacks(maxNow)
                       main.post {
                           try { sr.destroy() } catch (_: Exception) {}
                           try { pipe[0].close() } catch (_: Exception) {}
                       }
                       main.postDelayed({ startSession() }, restartDelayMs)
                   }
-
-                  sr.setRecognitionListener(object : RecognitionListener {
-                      override fun onResults(results: Bundle?) {
-                          val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                          if (!text.isNullOrBlank()) { failures = 0; onFinalText(text.trim()) }
-                          finish(100)
-                      }
-
-                      override fun onPartialResults(partialResults: Bundle?) {
-                          val t = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                          if (!t.isNullOrBlank()) {
-                              main.removeCallbacks(clearRunnable)
-                              overlay?.setOriginalOnly(t)
-                          }
-                      }
-
-                      override fun onError(error: Int) {
-                          val quiet = error == SpeechRecognizer.ERROR_NO_MATCH ||
-                              error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
-                          if (!quiet) failures++
-                          if (failures >= 6) {
-                              overlay?.set("Speech recognition isn’t accepting the captured audio on this phone.", "")
-                          }
-                          finish(if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 600 else if (quiet) 100 else 800)
-                      }
-
-                      override fun onReadyForSpeech(params: Bundle?) {}
-                      override fun onBeginningOfSpeech() {}
-                      override fun onRmsChanged(rmsdB: Float) {}
-                      override fun onBufferReceived(buffer: ByteArray?) {}
-                      override fun onEndOfSpeech() {}
-                      override fun onEvent(eventType: Int, params: Bundle?) {}
-                  })
-
-                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang.speechTag)
-                      putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                      putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, pipe[0])
-                      putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
-                      putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
-                      putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, SAMPLE_RATE)
-                  }
-                  sr.startListening(i)
               }
 
               private fun onFinalText(text: String) {
                   main.removeCallbacks(clearRunnable)
                   overlay?.setOriginalOnly(text)
                   translator?.translate(text) { en ->
-                      if (running && en != null) {
-                          overlay?.set(en, text)
+                      if (running) {
+                          if (en == null) overlay?.set("Couldn’t translate this line", text) else overlay?.set(en, text)
                           main.removeCallbacks(clearRunnable)
                           main.postDelayed(clearRunnable, CLEAR_AFTER_MS)
                       }
