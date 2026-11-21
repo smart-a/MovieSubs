@@ -86,6 +86,7 @@ jobs:
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
               <queries>
@@ -111,7 +112,7 @@ jobs:
                   <service
                       android:name=".CaptureService"
                       android:exported="false"
-                      android:foregroundServiceType="mediaProjection" />
+                      android:foregroundServiceType="mediaProjection|microphone" />
               </application>
           </manifest>
           __END_OF_FILE__
@@ -433,7 +434,11 @@ jobs:
                       .addAction(Notification.Action.Builder(null, "Stop", stop).build())
                       .setOngoing(true)
                       .build()
-                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  // The microphone type keeps speech recognition allowed after the user switches to the movie app.
+                  startForeground(
+                      1, n,
+                      ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                  )
               }
 
               private fun prepareTranslator(apiKey: String, done: (Boolean) -> Unit) {
@@ -562,8 +567,8 @@ jobs:
                                   error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
                               if (latest.isNotBlank()) onFinalText(latest.trim())
                               if (!quiet) failures++
-                              if (failures >= 6) {
-                                  overlay?.set("Speech recognition isn’t accepting the captured audio on this phone.", "")
+                              if (failures >= 4) {
+                                  overlay?.set("Speech recognition stopped (error $error). Trying again…", "")
                               }
                               end(if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 600 else if (quiet) 100 else 800)
                           }
